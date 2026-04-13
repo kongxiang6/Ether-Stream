@@ -1,0 +1,7 @@
+scapy
+Pillow
+numpy
+psutil
+mss
+opencv-python
+pyinstaller
