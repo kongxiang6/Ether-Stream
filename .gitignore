@@ -4,6 +4,8 @@ __pycache__/
 *.pyd
 
 build/
+release/
+npcap-1.79.exe
 
 sender_gui_config.json
 receiver_gui_config.json
@@ -11,5 +13,6 @@ receiver_gui_config.json
 
 ether-stream-release.zip
 ether-stream-single-file-release.zip
+Ether-Stream-*.zip
 Ether-Stream-文件夹版.zip
 Ether-Stream-单文件版.zip

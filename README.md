@@ -206,6 +206,17 @@ cd I:\AI\ether_stream
 - `Ether-Stream-文件夹版.zip`
 - `Ether-Stream-单文件版.zip`
 
+GitHub 仓库建议：
+
+- 仓库中只保留源码、文档和打包脚本
+- `release` 目录、`npcap-1.79.exe`、最终 exe 和 zip 成品包建议作为 GitHub Releases 附件发布
+- 不建议把大体积成品长期直接提交进源码仓库历史
+
+补充：
+
+- 如果项目根目录存在本地的 `npcap-1.79.exe`，打包脚本会自动把它复制到发布目录
+- 这个安装包不需要纳入 Git 仓库追踪
+
 注意：
 
 - 文件夹版：
