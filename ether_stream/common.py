@@ -196,6 +196,9 @@ class FrameAssembler:
     def clear(self) -> None:
         self._frames.clear()
 
+    def drop_frame(self, frame_id: int) -> None:
+        self._frames.pop(frame_id, None)
+
 
 def pack_fragment(
     frame_id: int,

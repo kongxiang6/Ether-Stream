@@ -40,7 +40,7 @@ class ReceiverController:
         self.receiver_thread: Optional[threading.Thread] = None
         self.processor_thread: Optional[threading.Thread] = None
         self.running = False
-        self.preview_enabled = True
+        self.preview_enabled = False
 
     def start(
         self,
@@ -54,7 +54,7 @@ class ReceiverController:
         from receiver import ProcessorThread, ReceiverThread
 
         if self.running:
-            raise RuntimeError("接收端已经在运行中")
+            raise RuntimeError("接收端已经在运行")
         if queue_size <= 0:
             raise ValueError("队列长度必须大于 0")
         if max_age <= 0:
@@ -161,9 +161,8 @@ class ReceiverApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Ether Stream 接收端")
-        self.geometry("1340x960")
-        self.minsize(1180, 820)
         self.configure(bg="#eef3f8")
+        self._set_initial_window_geometry()
 
         self.controller = ReceiverController()
         self.iface_map: Dict[str, str] = {}
@@ -174,10 +173,28 @@ class ReceiverApp(tk.Tk):
         self._loaded_config: Dict[str, str] = {}
         self._tick_after_id: Optional[str] = None
         self._iface_loading = False
+        self._layout_after_id: Optional[str] = None
+        self._compact_layout: Optional[bool] = None
+        self._stats_compact_layout: Optional[bool] = None
+        self._height_compact_layout: Optional[bool] = None
+        self._initial_refresh_after_id: Optional[str] = None
+        self._initial_layout_after_id: Optional[str] = None
         self._iface_result_queue: "queue.Queue[tuple[str, str, list[InterfaceInfo], Optional[InterfaceInfo], bool]]" = queue.Queue()
         self._last_rate_sample_time = time.perf_counter()
         self._last_forwarded_frames = 0.0
         self._last_auto_udp_host = ""
+        self._preview_photo: Optional[ImageTk.PhotoImage] = None
+        self._last_preview_image: Optional[Image.Image] = None
+        self._preview_refresh_after_id: Optional[str] = None
+        self._stat_cards: list[ttk.Frame] = []
+        self._scroll_canvas: Optional[tk.Canvas] = None
+        self._scroll_body: Optional[ttk.Frame] = None
+        self._scroll_window_id: Optional[int] = None
+        self._help_text_full = (
+            "快速上手：先选择推荐网卡，再检查 UDP 转发地址是否是接收程序实际监听的 IP:端口。\n"
+            "如果第三方程序绑定的是物理网卡 IP，不要继续使用 127.0.0.1。"
+        )
+        self._help_text_compact = "先选推荐网卡，再核对 UDP 转发地址是否和第三方程序监听的 IP:端口一致。"
 
         self.iface_var = tk.StringVar()
         self.udp_target_var = tk.StringVar(value="127.0.0.1:4455")
@@ -193,18 +210,27 @@ class ReceiverApp(tk.Tk):
         self.forward_stat_var = tk.StringVar(value="0")
         self.queue_stat_var = tk.StringVar(value="0")
         self.detail_var = tk.StringVar(value="等待启动后显示统计信息")
-        self.preview_hint_var = tk.StringVar(value="等待接收到第一帧画面")
-        self.preview_meta_var = tk.StringVar(value="原始分辨率: 已关闭")
-        self._preview_photo: Optional[ImageTk.PhotoImage] = None
-        self._last_preview_image: Optional[Image.Image] = None
+        self.preview_hint_var = tk.StringVar(value="实时预览默认关闭")
+        self.preview_meta_var = tk.StringVar(value="预览分辨率：未启用")
 
         self._build_styles()
         self._build_ui()
         self._load_config()
+        self._update_preview_enabled_ui()
         self._set_interface_loading("正在加载网卡，请稍候...")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(60, lambda: self._refresh_interfaces(initial=True))
+        self.bind("<Configure>", self._on_window_configure)
+        self._initial_refresh_after_id = self.after(60, lambda: self._refresh_interfaces(initial=True))
+        self._initial_layout_after_id = self.after(120, self._apply_responsive_layout)
         self._tick_after_id = self.after(100, self._tick)
+
+    def _set_initial_window_geometry(self) -> None:
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        width = min(max(1060, int(screen_width * 0.93)), 1480)
+        height = min(max(780, int(screen_height * 0.91)), 1040)
+        self.geometry(f"{width}x{height}")
+        self.minsize(min(width, 980), min(height, 720))
 
     def _build_styles(self) -> None:
         style = ttk.Style(self)
@@ -223,184 +249,185 @@ class ReceiverApp(tk.Tk):
         style.configure("CardTitle.TLabel", background="#ffffff", foreground="#12395d", font=("Microsoft YaHei UI", 13, "bold"))
         style.configure("CardHint.TLabel", background="#ffffff", foreground="#6e7a88", font=("Microsoft YaHei UI", 10))
         style.configure("Field.TLabel", background="#ffffff", foreground="#25313d", font=("Microsoft YaHei UI", 11))
-        style.configure("BadgeIdle.TLabel", background="#d8e1ec", foreground="#24405c", padding=(18, 10), font=("Microsoft YaHei UI", 11, "bold"))
-        style.configure("BadgeRun.TLabel", background="#d9f5e4", foreground="#197245", padding=(18, 10), font=("Microsoft YaHei UI", 11, "bold"))
-        style.configure("BadgeStop.TLabel", background="#fde6c8", foreground="#8a5412", padding=(18, 10), font=("Microsoft YaHei UI", 11, "bold"))
-        style.configure("Primary.TButton", font=("Microsoft YaHei UI", 11, "bold"), padding=(18, 10))
-        style.configure("Secondary.TButton", font=("Microsoft YaHei UI", 11), padding=(18, 10))
+        style.configure("BadgeIdle.TLabel", background="#d8e1ec", foreground="#24405c", padding=(16, 8), font=("Microsoft YaHei UI", 11, "bold"))
+        style.configure("BadgeRun.TLabel", background="#d9f5e4", foreground="#197245", padding=(16, 8), font=("Microsoft YaHei UI", 11, "bold"))
+        style.configure("BadgeStop.TLabel", background="#fde6c8", foreground="#8a5412", padding=(16, 8), font=("Microsoft YaHei UI", 11, "bold"))
+        style.configure("Primary.TButton", font=("Microsoft YaHei UI", 11, "bold"), padding=(16, 8))
+        style.configure("Secondary.TButton", font=("Microsoft YaHei UI", 11), padding=(16, 8))
         style.configure("StatCard.TFrame", background="#ffffff")
-        style.configure("StatValue.TLabel", background="#ffffff", foreground="#12395d", font=("Microsoft YaHei UI", 20, "bold"))
+        style.configure("StatValue.TLabel", background="#ffffff", foreground="#12395d", font=("Microsoft YaHei UI", 18, "bold"))
         style.configure("StatName.TLabel", background="#ffffff", foreground="#6e7a88", font=("Microsoft YaHei UI", 10))
+        style.configure("Preview.TCheckbutton", background="#ffffff")
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=4, minsize=390)
-        self.rowconfigure(4, weight=3, minsize=220)
+        self.rowconfigure(0, weight=1)
 
-        hero = ttk.Frame(self, style="Hero.TFrame", padding=(26, 20))
-        hero.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 14))
-        hero.columnconfigure(0, weight=1)
-        ttk.Label(hero, text="Ether Stream 接收端", style="HeroTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            hero,
-            text="监听原始以太网帧，完成分片重组后转发到本机或远程 UDP 服务。",
+        shell = ttk.Frame(self, style="Page.TFrame")
+        shell.grid(row=0, column=0, sticky="nsew")
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+
+        self._scroll_canvas = tk.Canvas(shell, bg="#eef3f8", highlightthickness=0, bd=0)
+        self._scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        scroll_bar = ttk.Scrollbar(shell, orient="vertical", command=self._scroll_canvas.yview)
+        scroll_bar.grid(row=0, column=1, sticky="ns")
+        self._scroll_canvas.configure(yscrollcommand=scroll_bar.set)
+
+        self._scroll_body = ttk.Frame(self._scroll_canvas, style="Page.TFrame")
+        self._scroll_window_id = self._scroll_canvas.create_window(0, 0, window=self._scroll_body, anchor="nw")
+        self._scroll_body.bind("<Configure>", self._on_scroll_body_configure)
+        self._scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
+        self._scroll_canvas.bind("<Enter>", self._bind_mousewheel)
+        self._scroll_canvas.bind("<Leave>", self._unbind_mousewheel)
+
+        self.page = self._scroll_body
+        self.page.columnconfigure(0, weight=1)
+
+        self.hero = ttk.Frame(self.page, style="Hero.TFrame", padding=(26, 20))
+        self.hero.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 14))
+        self.hero.columnconfigure(0, weight=1)
+        ttk.Label(self.hero, text="Ether Stream 接收端", style="HeroTitle.TLabel").grid(row=0, column=0, sticky="w")
+        self.hero_subtitle = ttk.Label(
+            self.hero,
+            text="抓取原始以太网分片，完成拼包后转发为单包 JPEG UDP，并可在界面内实时预览。",
             style="HeroSub.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.status_badge = ttk.Label(hero, textvariable=self.status_var, style="BadgeIdle.TLabel")
+        )
+        self.hero_subtitle.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.status_badge = ttk.Label(self.hero, textvariable=self.status_var, style="BadgeIdle.TLabel")
         self.status_badge.grid(row=0, column=1, rowspan=2, sticky="e")
 
-        content = ttk.Frame(self, style="Page.TFrame")
-        content.grid(row=1, column=0, sticky="nsew", padx=18)
-        content.columnconfigure(0, weight=8)
-        content.columnconfigure(1, weight=6)
-        content.rowconfigure(0, weight=1)
+        self.content = ttk.Frame(self.page, style="Page.TFrame")
+        self.content.grid(row=1, column=0, sticky="ew", padx=18)
+        self.content.columnconfigure(0, weight=8)
+        self.content.columnconfigure(1, weight=7)
 
-        config_card = ttk.Frame(content, style="Card.TFrame", padding=18)
-        config_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        config_card.columnconfigure(1, weight=1)
-        config_card.columnconfigure(2, minsize=124)
-        ttk.Label(config_card, text="接收参数", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(config_card, text="网卡会自动排序并标出推荐项。鼠标停留可查看中文说明。", style="CardHint.TLabel").grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(2, 8)
+        self.config_card = ttk.Frame(self.content, style="Card.TFrame", padding=18)
+        self.config_card.columnconfigure(1, weight=1)
+        self.config_card.columnconfigure(2, minsize=124)
+        ttk.Label(self.config_card, text="接收参数", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.config_hint_label = ttk.Label(
+            self.config_card,
+            text="监听网卡会优先显示推荐的实体网卡。选择后会自动带出该网卡的本机 IPv4 地址。",
+            style="CardHint.TLabel",
         )
+        self.config_hint_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 8))
 
         field_specs = [
-            ("监听网卡", self.iface_var, "combo", "程序会把最可能正确的实体网卡排到最前面，并标记为推荐。"),
-            ("UDP 转发地址", self.udp_target_var, "entry", "格式：IP:端口，例如 192.168.2.1:4455"),
-            ("队列长度", self.queue_size_var, "entry", "抓包后暂存分片的队列大小。数值越大越抗抖动，但占用更多内存。"),
-            ("拼包超时(秒)", self.max_age_var, "entry", "同一帧分片等待的最长时间。越小延迟越低，越大容错越强。"),
+            ("监听网卡", self.iface_var, "combo", "选择接收原始以太网分片的网卡。程序会优先推荐已连接的有线网卡。"),
+            ("UDP 转发地址", self.udp_target_var, "entry", "格式示例：192.168.2.1:4455。接收端会把完整 JPEG 作为单个 UDP 包转发到这里。"),
+            ("队列长度", self.queue_size_var, "entry", "接收分片时的缓存队列长度。越大越能抗瞬时抖动，但堆积过多会增加旧帧排队。"),
+            ("拼包超时(秒)", self.max_age_var, "entry", "同一帧分片在这个时间内没收齐就丢弃，避免半帧长期占用队列。"),
         ]
 
         row_index = 2
         for label_text, variable, kind, tip_text in field_specs:
-            label = ttk.Label(config_card, text=label_text, style="Field.TLabel")
+            label = ttk.Label(self.config_card, text=label_text, style="Field.TLabel")
             label.grid(row=row_index, column=0, sticky="w", padx=(0, 12), pady=6)
             ToolTip(label, tip_text)
             if kind == "combo":
-                self.iface_combo = ttk.Combobox(config_card, textvariable=variable, state="readonly", width=42)
+                self.iface_combo = ttk.Combobox(self.config_card, textvariable=variable, state="readonly")
                 self.iface_combo.grid(row=row_index, column=1, sticky="ew", pady=6)
                 self.iface_combo.bind("<<ComboboxSelected>>", self._on_iface_changed)
                 ToolTip(self.iface_combo, tip_text)
-                self.refresh_button = ttk.Button(config_card, text="刷新网卡", command=self._refresh_interfaces)
+                self.refresh_button = ttk.Button(self.config_card, text="刷新网卡", command=self._refresh_interfaces)
                 self.refresh_button.grid(row=row_index, column=2, sticky="ew", padx=(10, 0), pady=6)
-                ToolTip(self.refresh_button, "重新扫描一次本机所有可用网卡。")
+                ToolTip(self.refresh_button, "重新扫描本机可用网卡。")
             else:
-                entry = ttk.Entry(config_card, textvariable=variable)
+                entry = ttk.Entry(self.config_card, textvariable=variable)
                 entry.grid(row=row_index, column=1, columnspan=2, sticky="ew", pady=6)
                 ToolTip(entry, tip_text)
             row_index += 1
 
-        help_card = ttk.Frame(content, style="Card.TFrame", padding=18)
-        help_card.grid(row=0, column=1, sticky="nsew")
-        help_card.columnconfigure(0, weight=1)
-        help_card.rowconfigure(5, weight=1)
-        ttk.Label(help_card, text="运行状态", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(help_card, textvariable=self.subtitle_var, style="CardHint.TLabel", wraplength=420, justify="left").grid(
-            row=1, column=0, sticky="ew", pady=(2, 6)
-        )
-        ttk.Label(help_card, textvariable=self.iface_hint_var, style="CardHint.TLabel", wraplength=420, justify="left").grid(
-            row=2, column=0, sticky="ew", pady=(0, 8)
-        )
-        ttk.Label(
-            help_card,
-            text="格式：IP:端口，例如 192.168.2.1:4455",
-            style="CardHint.TLabel",
-            wraplength=420,
-            justify="left",
-        ).grid(row=3, column=0, sticky="ew")
+        self.side_panel = ttk.Frame(self.content, style="Page.TFrame")
+        self.side_panel.columnconfigure(0, weight=1)
 
-        action_bar = ttk.Frame(help_card, style="Card.TFrame")
+        self.help_card = ttk.Frame(self.side_panel, style="Card.TFrame", padding=18)
+        self.help_card.columnconfigure(0, weight=1)
+        ttk.Label(self.help_card, text="运行状态", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        self.subtitle_label = ttk.Label(self.help_card, textvariable=self.subtitle_var, style="CardHint.TLabel", justify="left")
+        self.subtitle_label.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        self.iface_hint_label = ttk.Label(self.help_card, textvariable=self.iface_hint_var, style="CardHint.TLabel", justify="left")
+        self.iface_hint_label.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self.help_text_label = ttk.Label(
+            self.help_card,
+            text=(
+                "快速上手：先选择推荐网卡，再检查 UDP 转发地址是否是接收程序实际监听的 IP:端口。\n"
+                "如果第三方程序绑定的是物理网卡 IP，不要继续使用 127.0.0.1。"
+            ),
+            style="CardHint.TLabel",
+            justify="left",
+        )
+        self.help_text_label.grid(row=3, column=0, sticky="ew")
+
+        action_bar = ttk.Frame(self.help_card, style="Card.TFrame")
         action_bar.grid(row=4, column=0, sticky="ew", pady=(14, 0))
         action_bar.columnconfigure(0, weight=1)
         action_bar.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(action_bar, text="开始接收", style="Primary.TButton", command=self._start)
         self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ToolTip(self.start_button, "按当前参数开始抓包并重组以太网分片。")
+        ToolTip(self.start_button, "按当前参数开始抓包、拼包并转发。")
         self.stop_button = ttk.Button(action_bar, text="停止接收", style="Secondary.TButton", command=self._stop)
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        ToolTip(self.stop_button, "停止抓包和转发，保留当前参数。")
+        ToolTip(self.stop_button, "停止接收线程和处理线程。")
         self.stop_button.state(["disabled"])
 
-        preview_frame = ttk.Frame(help_card, style="Card.TFrame")
-        preview_frame.grid(row=5, column=0, sticky="nsew", pady=(16, 0))
-        preview_frame.columnconfigure(0, weight=1)
-        preview_frame.rowconfigure(2, weight=1)
-        preview_header = ttk.Frame(preview_frame, style="Card.TFrame")
+        self.preview_card = ttk.Frame(self.side_panel, style="Card.TFrame", padding=18)
+        self.preview_card.columnconfigure(0, weight=1)
+        self.preview_card.rowconfigure(1, weight=1)
+        preview_header = ttk.Frame(self.preview_card, style="Card.TFrame")
         preview_header.grid(row=0, column=0, sticky="ew")
-        preview_header.columnconfigure(2, weight=1)
+        preview_header.columnconfigure(0, weight=1)
         ttk.Label(preview_header, text="实时预览", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.preview_check = tk.Checkbutton(
+        self.preview_check = ttk.Checkbutton(
             preview_header,
             variable=self.preview_enabled_var,
+            style="Preview.TCheckbutton",
             command=self._on_preview_toggle,
-            text="",
-            width=2,
-            height=2,
-            bg="#ffffff",
-            activebackground="#ffffff",
-            selectcolor="#ffffff",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            anchor="center",
-            font=("Segoe UI Symbol", 16, "bold"),
+            takefocus=False,
         )
-        self.preview_check.grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 2))
-        ToolTip(self.preview_check, "勾选后显示实时预览；取消勾选后仅保留抓包和 UDP 转发。")
-        ttk.Label(preview_header, textvariable=self.preview_meta_var, style="CardHint.TLabel").grid(
-            row=0, column=2, sticky="e"
-        )
-        self.preview_stage = tk.Frame(preview_frame, bg="#eef3f8", width=372, height=372, bd=0, highlightthickness=0)
-        self.preview_stage.grid(row=2, column=0, sticky="n", pady=(12, 0))
-        self.preview_stage.grid_propagate(False)
-        self.preview_stage.columnconfigure(0, weight=1)
-        self.preview_stage.rowconfigure(0, weight=1)
-        self.preview_canvas = tk.Canvas(
-            self.preview_stage,
-            bg="#eef3f8",
-            relief="flat",
-            highlightthickness=0,
-            bd=0,
-        )
-        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
-        self.preview_canvas.bind("<Configure>", self._on_preview_canvas_configure)
+        self.preview_check.grid(row=0, column=1, sticky="e")
+        ToolTip(self.preview_check, "勾上后显示接收到的最新完整 JPEG 预览；关闭可减少界面解码和缩放负担。")
+
+        self.preview_host = tk.Frame(self.preview_card, bg="#f4f7fb", highlightthickness=0, bd=0)
+        self.preview_host.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        self.preview_host.grid_propagate(False)
+        self.preview_host.configure(height=320)
         self.preview_label = tk.Label(
-            self.preview_stage,
+            self.preview_host,
             textvariable=self.preview_hint_var,
-            anchor="center",
+            bg="#f4f7fb",
+            fg="#6e7a88",
+            font=("Microsoft YaHei UI", 10),
             justify="center",
-            bg="#eef3f8",
-            fg="#52606d",
-            relief="flat",
-            font=("Microsoft YaHei UI", 11),
         )
-        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
+        self.preview_host.bind("<Configure>", self._on_preview_host_resize)
+        self.preview_meta_label = ttk.Label(self.preview_card, textvariable=self.preview_meta_var, style="CardHint.TLabel", justify="left")
+        self.preview_meta_label.grid(row=2, column=0, sticky="ew", pady=(10, 0))
 
-        detail_card = ttk.Frame(self, style="Card.TFrame", padding=(18, 14))
-        detail_card.grid(row=2, column=0, sticky="ew", padx=18, pady=(14, 10))
-        detail_card.columnconfigure(0, weight=1)
-        ttk.Label(detail_card, text="实时详情", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(detail_card, textvariable=self.detail_var, style="CardHint.TLabel", wraplength=1200, justify="left").grid(
-            row=1, column=0, sticky="ew", pady=(8, 0)
-        )
+        self.detail_card = ttk.Frame(self.page, style="Card.TFrame", padding=(18, 14))
+        self.detail_card.grid(row=2, column=0, sticky="ew", padx=18, pady=(14, 10))
+        self.detail_card.columnconfigure(0, weight=1)
+        ttk.Label(self.detail_card, text="实时详情", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        self.detail_label = ttk.Label(self.detail_card, textvariable=self.detail_var, style="CardHint.TLabel", justify="left")
+        self.detail_label.grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
-        stats_row = ttk.Frame(self, style="Page.TFrame")
-        stats_row.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 14))
-        for column in range(4):
-            stats_row.columnconfigure(column, weight=1)
-        self._build_stat_card(stats_row, 0, "已捕获包数", self.capture_stat_var)
-        self._build_stat_card(stats_row, 1, "已处理分片", self.process_stat_var)
-        self._build_stat_card(stats_row, 2, "已转发帧数", self.forward_stat_var)
-        self._build_stat_card(stats_row, 3, "当前队列深度", self.queue_stat_var)
+        self.stats_row = ttk.Frame(self.page, style="Page.TFrame")
+        self.stats_row.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 14))
+        self._build_stat_card(self.stats_row, "抓到分片", self.capture_stat_var)
+        self._build_stat_card(self.stats_row, "处理分片", self.process_stat_var)
+        self._build_stat_card(self.stats_row, "转发整帧", self.forward_stat_var)
+        self._build_stat_card(self.stats_row, "当前队列", self.queue_stat_var)
 
-        log_card = ttk.Frame(self, style="Card.TFrame", padding=18)
-        log_card.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 18))
-        log_card.columnconfigure(0, weight=1)
-        log_card.rowconfigure(1, weight=1)
-        ttk.Label(log_card, text="运行日志", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        self.log_card = ttk.Frame(self.page, style="Card.TFrame", padding=18)
+        self.log_card.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self.log_card.columnconfigure(0, weight=1)
+        self.log_card.rowconfigure(1, weight=1)
+        ttk.Label(self.log_card, text="运行日志", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
         self.log_box = scrolledtext.ScrolledText(
-            log_card,
-            height=12,
+            self.log_card,
+            height=11,
             bg="#0f1b2d",
             fg="#dbe5f0",
             insertbackground="#ffffff",
@@ -414,12 +441,141 @@ class ReceiverApp(tk.Tk):
 
         self._set_status("idle", "待机", "等待开始接收数据")
 
-    def _build_stat_card(self, parent: ttk.Frame, column: int, title: str, variable: tk.StringVar) -> None:
+    def _build_stat_card(self, parent: ttk.Frame, title: str, variable: tk.StringVar) -> None:
         card = ttk.Frame(parent, style="StatCard.TFrame", padding=(18, 14))
-        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 10, 0))
         card.columnconfigure(0, weight=1)
         ttk.Label(card, text=title, style="StatName.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(card, textvariable=variable, style="StatValue.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self._stat_cards.append(card)
+
+    def _on_scroll_body_configure(self, _: tk.Event[tk.Misc]) -> None:
+        if self._scroll_canvas is None:
+            return
+        self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+
+    def _on_scroll_canvas_configure(self, event: tk.Event[tk.Misc]) -> None:
+        if self._scroll_canvas is None or self._scroll_window_id is None:
+            return
+        self._scroll_canvas.itemconfigure(self._scroll_window_id, width=max(1, int(event.width)))
+
+    def _bind_mousewheel(self, _: tk.Event[tk.Misc]) -> None:
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+
+    def _unbind_mousewheel(self, _: tk.Event[tk.Misc]) -> None:
+        self.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event: tk.Event[tk.Misc]) -> None:
+        if self._scroll_canvas is None:
+            return
+        delta = int(getattr(event, "delta", 0))
+        if delta == 0:
+            return
+        self._scroll_canvas.yview_scroll(-1 * int(delta / 120), "units")
+
+    def _apply_responsive_layout(self) -> None:
+        width = max(1, self.winfo_width())
+        height = max(1, self.winfo_height())
+        compact = width < 1000
+        if compact != self._compact_layout:
+            self._compact_layout = compact
+            self.config_card.grid_forget()
+            self.side_panel.grid_forget()
+            self.help_card.grid_forget()
+            self.preview_card.grid_forget()
+            if compact:
+                self.content.columnconfigure(0, weight=1)
+                self.content.columnconfigure(1, weight=0)
+                self.content.rowconfigure(0, weight=0)
+                self.content.rowconfigure(1, weight=0)
+                self.content.rowconfigure(2, weight=0)
+                self.config_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+                self.side_panel.grid(row=1, column=0, sticky="ew")
+                self.side_panel.rowconfigure(0, weight=0)
+                self.side_panel.rowconfigure(1, weight=0)
+                self.help_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+                self.preview_card.grid(row=1, column=0, sticky="ew")
+            else:
+                self.content.columnconfigure(0, weight=8)
+                self.content.columnconfigure(1, weight=7)
+                self.content.rowconfigure(0, weight=0)
+                self.content.rowconfigure(1, weight=0)
+                self.content.rowconfigure(2, weight=0)
+                self.config_card.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+                self.side_panel.grid(row=0, column=1, sticky="ew")
+                self.side_panel.rowconfigure(0, weight=0)
+                self.side_panel.rowconfigure(1, weight=0)
+                self.help_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+                self.preview_card.grid(row=1, column=0, sticky="ew")
+
+        height_compact = height < 860
+        if height_compact != self._height_compact_layout:
+            self._height_compact_layout = height_compact
+            self.hero.configure(padding=(20, 12) if height_compact else (22, 16))
+            self.config_card.configure(padding=12 if height_compact else 14)
+            self.help_card.configure(padding=12 if height_compact else 14)
+            self.preview_card.configure(padding=10 if height_compact else 14)
+            self.detail_card.configure(padding=(12, 8) if height_compact else (14, 10))
+            self.log_card.configure(padding=12 if height_compact else 14)
+            self.log_box.configure(height=3 if height_compact else 4)
+            self.help_text_label.configure(text=self._help_text_compact if height_compact else self._help_text_full)
+
+        stats_compact = width < 960
+        if stats_compact != self._stats_compact_layout:
+            self._stats_compact_layout = stats_compact
+            for card in self._stat_cards:
+                card.grid_forget()
+            if stats_compact:
+                self.stats_row.rowconfigure(0, weight=1)
+                self.stats_row.rowconfigure(1, weight=1)
+                for column in range(2):
+                    self.stats_row.columnconfigure(column, weight=1)
+                for index, card in enumerate(self._stat_cards):
+                    row = index // 2
+                    column = index % 2
+                    padx = (0, 10) if column == 0 else (0, 0)
+                    pady = (0, 10) if row == 0 else (0, 0)
+                    card.grid(row=row, column=column, sticky="nsew", padx=padx, pady=pady)
+            else:
+                self.stats_row.rowconfigure(0, weight=1)
+                self.stats_row.rowconfigure(1, weight=0)
+                for column in range(4):
+                    self.stats_row.columnconfigure(column, weight=1)
+                for index, card in enumerate(self._stat_cards):
+                    padx = (0, 10) if index < len(self._stat_cards) - 1 else (0, 0)
+                    card.grid(row=0, column=index, sticky="nsew", padx=padx)
+
+        for card in self._stat_cards:
+            card.configure(padding=(10, 8) if height_compact else (12, 10))
+
+        wrap_width = max(380, width - 120)
+        detail_wrap = max(520, width - 120)
+        side_wrap = 420 if not compact else max(480, width - 120)
+        self.detail_label.configure(wraplength=detail_wrap)
+        self.subtitle_label.configure(wraplength=side_wrap)
+        self.iface_hint_label.configure(wraplength=side_wrap)
+        self.help_text_label.configure(wraplength=side_wrap)
+        self.config_hint_label.configure(wraplength=wrap_width // 2)
+        self.preview_meta_label.configure(wraplength=side_wrap)
+        self.hero_subtitle.configure(wraplength=max(440, width - 260))
+        self.preview_card.grid_configure(pady=(0, 8) if height_compact else (0, 10))
+        self.stats_row.grid_configure(pady=(0, 10) if height_compact else (0, 14))
+        self.log_card.grid_configure(pady=(0, 12) if height_compact else (0, 18))
+        self._apply_preview_card_state()
+        self._schedule_preview_refresh()
+
+    def _on_window_configure(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is not self:
+            return
+        if self._layout_after_id is not None:
+            try:
+                self.after_cancel(self._layout_after_id)
+            except tk.TclError:
+                pass
+        self._layout_after_id = self.after(80, self._finish_layout_refresh)
+
+    def _finish_layout_refresh(self) -> None:
+        self._layout_after_id = None
+        self._apply_responsive_layout()
 
     def _refresh_interfaces(self, initial: bool = False) -> None:
         if self._iface_loading and not initial:
@@ -480,12 +636,9 @@ class ReceiverApp(tk.Tk):
         self.iface_combo.configure(state="readonly" if values else "disabled")
         self.refresh_button.state(["!disabled"])
         self._update_iface_hint()
-        self._sync_udp_target_to_selected_iface()
+        self._autofill_udp_target_from_selected(force=initial)
         if not self.controller.running:
-            if values:
-                self.start_button.state(["!disabled"])
-            else:
-                self.start_button.state(["disabled"])
+            self.start_button.state(["!disabled"] if values else ["disabled"])
         if not initial:
             self._log(f"已刷新网卡列表，当前显示 {len(values)} 项，共识别到 {all_count} 项")
         elif values:
@@ -503,38 +656,14 @@ class ReceiverApp(tk.Tk):
 
     def _on_iface_changed(self, _: object = None) -> None:
         self._update_iface_hint()
-        self._sync_udp_target_to_selected_iface(force=True)
-
-    def _sync_udp_target_to_selected_iface(self, *, force: bool = False) -> None:
-        current_raw = self.iface_map.get(self.iface_var.get().strip(), "")
-        selected = self.interface_lookup.get(current_raw)
-        if selected is None or not selected.ipv4_address:
-            return
-
-        current_value = self.udp_target_var.get().strip()
-        current_host = ""
-        port_text = "4455"
-        if current_value:
-            host_part, separator, port_part = current_value.rpartition(":")
-            if separator and port_part.isdigit():
-                current_host = host_part.strip()
-                port_text = port_part.strip()
-            else:
-                current_host = current_value
-
-        should_replace = force or not current_host or current_host in {"127.0.0.1", "192.168.2.1", self._last_auto_udp_host}
-        if not should_replace:
-            return
-
-        self.udp_target_var.set(f"{selected.ipv4_address}:{port_text}")
-        self._last_auto_udp_host = selected.ipv4_address
+        self._autofill_udp_target_from_selected(force=False)
 
     def _update_iface_hint(self) -> None:
         current_raw = self.iface_map.get(self.iface_var.get().strip(), "")
         selected = self.interface_lookup.get(current_raw)
         recommended = self.interface_lookup.get(self.recommended_iface_raw)
         if selected is None and recommended is None:
-            self.iface_hint_var.set("没有可用网卡。请确认已安装 Npcap，并用管理员运行程序。")
+            self.iface_hint_var.set("没有可用网卡。请确认已安装 Npcap，并用管理员权限运行程序。")
             return
         if selected is not None and current_raw == self.recommended_iface_raw:
             title, detail = summarize_interface(selected)
@@ -551,17 +680,116 @@ class ReceiverApp(tk.Tk):
         title, detail = summarize_interface(selected) if selected is not None else ("", "")
         self.iface_hint_var.set(f"当前选择：{title}\n{detail}")
 
+    def _autofill_udp_target_from_selected(self, force: bool) -> None:
+        current_raw = self.iface_map.get(self.iface_var.get().strip(), "")
+        selected = self.interface_lookup.get(current_raw)
+        if selected is None or not selected.ipv4_address:
+            return
+
+        current_value = self.udp_target_var.get().strip()
+        current_host = ""
+        current_port = 4455
+        if current_value:
+            try:
+                current_host, current_port = parse_udp_target(current_value)
+            except Exception:
+                current_host = current_value
+                current_port = 4455
+
+        auto_hosts = {"", "127.0.0.1", "localhost", "0.0.0.0"}
+        should_replace = force or current_host in auto_hosts or current_host == self._last_auto_udp_host
+        if not should_replace:
+            return
+
+        self.udp_target_var.set(f"{selected.ipv4_address}:{current_port}")
+        self._last_auto_udp_host = selected.ipv4_address
+
+    def _parse_udp_target(self) -> str:
+        value = self.udp_target_var.get().strip()
+        host, port = parse_udp_target(value)
+        return f"{host}:{port}"
+
+    def _on_preview_toggle(self) -> None:
+        enabled = bool(self.preview_enabled_var.get())
+        self.controller.set_preview_enabled(enabled)
+        self._update_preview_enabled_ui()
+        if enabled:
+            self._schedule_preview_refresh()
+            self._log("已开启实时预览")
+        else:
+            self._clear_preview("实时预览已关闭", "预览分辨率：未启用")
+            self._log("已关闭实时预览")
+
+    def _update_preview_enabled_ui(self) -> None:
+        if self.preview_enabled_var.get():
+            if self._last_preview_image is None:
+                self.preview_hint_var.set("等待接收第一帧画面")
+                self.preview_meta_var.set("预览分辨率：等待数据")
+        else:
+            self.preview_hint_var.set("实时预览默认关闭")
+            self.preview_meta_var.set("预览分辨率：未启用")
+        self.controller.set_preview_enabled(bool(self.preview_enabled_var.get()))
+        self._apply_preview_card_state()
+
+    def _on_preview_host_resize(self, _: tk.Event[tk.Misc]) -> None:
+        self._schedule_preview_refresh()
+
+    def _schedule_preview_refresh(self) -> None:
+        if self._preview_refresh_after_id is not None:
+            try:
+                self.after_cancel(self._preview_refresh_after_id)
+            except tk.TclError:
+                pass
+        self._preview_refresh_after_id = self.after(20, self._refresh_preview_image)
+
+    def _refresh_preview_image(self) -> None:
+        self._preview_refresh_after_id = None
+        if not self.preview_enabled_var.get() or self._last_preview_image is None:
+            return
+        max_width = max(1, self.preview_host.winfo_width() - 20)
+        max_height = max(1, self.preview_host.winfo_height() - 20)
+        if max_width < 20 or max_height < 20:
+            return
+        image = ImageOps.contain(self._last_preview_image, (max_width, max_height), method=Image.Resampling.LANCZOS)
+        self._preview_photo = ImageTk.PhotoImage(image)
+        self.preview_label.configure(image=self._preview_photo, text="")
+        self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _clear_preview(self, hint: str, meta: str) -> None:
+        self._preview_photo = None
+        self._last_preview_image = None
+        self.preview_hint_var.set(hint)
+        self.preview_meta_var.set(meta)
+        self.preview_label.configure(image="", textvariable=self.preview_hint_var)
+        self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _apply_preview_card_state(self) -> None:
+        compact_height = bool(self._height_compact_layout)
+        enabled = bool(self.preview_enabled_var.get())
+        if enabled:
+            preview_height = 150 if compact_height else 220
+            self.preview_host.grid()
+            self.preview_meta_label.grid()
+            self.preview_host.configure(height=preview_height)
+        else:
+            self.preview_host.grid_remove()
+            self.preview_meta_label.grid_remove()
+            self.preview_card.configure(padding=12 if compact_height else 14)
+
     def _start(self) -> None:
         if self.controller.running:
             return
         try:
             iface = self._selected_iface()
+            udp_target = self._parse_udp_target()
+            queue_size = int(self.queue_size_var.get().strip())
+            max_age = float(self.max_age_var.get().strip())
             self.controller.start(
                 iface=iface,
-                udp_target=self.udp_target_var.get().strip(),
-                queue_size=int(self.queue_size_var.get().strip()),
-                max_age=float(self.max_age_var.get().strip()),
-                preview_enabled=self.preview_enabled_var.get(),
+                udp_target=udp_target,
+                queue_size=queue_size,
+                max_age=max_age,
+                preview_enabled=bool(self.preview_enabled_var.get()),
             )
         except Exception as exc:
             messagebox.showerror("接收端", str(exc), parent=self)
@@ -571,18 +799,20 @@ class ReceiverApp(tk.Tk):
         self._save_config()
         self._last_rate_sample_time = time.perf_counter()
         self._last_forwarded_frames = 0.0
-        self._set_status("running", "运行中", "正在监听原始以太网帧")
-        self.preview_meta_var.set("原始分辨率: 等待新画面")
-        self._clear_preview("正在等待第一帧画面...")
-        self._log(f"接收端已启动，接口: {iface}")
-        self._log(f"UDP 转发目标: {self.udp_target_var.get().strip()}")
+        if self.preview_enabled_var.get():
+            self._clear_preview("等待接收第一帧画面", "预览分辨率：等待数据")
+        else:
+            self._clear_preview("实时预览默认关闭", "预览分辨率：未启用")
+        self._set_status("running", "运行中", "正在持续接收、拼包并转发画面")
+        self._log(f"接收端已启动，监听接口：{iface}")
+        self._log(f"UDP 转发地址：{udp_target}")
 
     def _stop(self) -> None:
         if not self.controller.running:
             return
         if self._stop_worker is not None and self._stop_worker.is_alive():
             return
-        self._set_status("stopping", "停止中", "正在等待抓包和处理线程退出")
+        self._set_status("stopping", "停止中", "正在等待工作线程退出")
         self._log("正在停止接收端...")
         self._stop_worker = threading.Thread(target=self._stop_in_background, daemon=True)
         self._stop_worker.start()
@@ -593,8 +823,6 @@ class ReceiverApp(tk.Tk):
 
     def _finish_stop(self) -> None:
         self._set_status("idle", "已停止", "接收端已停止，参数已保留")
-        self.preview_meta_var.set("原始分辨率: 暂无")
-        self._clear_preview("已停止接收，预览已暂停")
         self._log("接收端已停止")
         if self._close_after_stop:
             self._cancel_tick()
@@ -602,28 +830,48 @@ class ReceiverApp(tk.Tk):
 
     def _tick(self) -> None:
         self._drain_iface_results()
-        self._drain_preview_frames()
         snapshot = self.controller.snapshot()
         now = time.perf_counter()
         elapsed = max(0.001, now - self._last_rate_sample_time)
         forwarded_frames = snapshot.get("forwarded_frames", 0.0)
-        receive_fps = max(0.0, (forwarded_frames - self._last_forwarded_frames) / elapsed)
+        forward_fps = max(0.0, (forwarded_frames - self._last_forwarded_frames) / elapsed)
         self._last_rate_sample_time = now
         self._last_forwarded_frames = forwarded_frames
+
         self.capture_stat_var.set(f"{snapshot.get('captured_packets', 0):.0f}")
         self.process_stat_var.set(f"{snapshot.get('processed_fragments', 0):.0f}")
         self.forward_stat_var.set(f"{snapshot.get('forwarded_frames', 0):.0f}")
         self.queue_stat_var.set(f"{snapshot.get('queue_depth', 0):.0f}")
+
+        oversize_bytes = snapshot.get("last_udp_oversize_bytes", 0.0) / 1024.0
         self.detail_var.set(
-            "接收帧率 {receive_fps:.1f} fps  |  接收端处理延迟 {process_ms:.1f} ms  |  队列丢弃 {queue_drop:.0f}  |  队列裁剪 {queue_trim:.0f}  |  UDP 丢弃 {udp_drop:.0f}  |  解码错误 {decode_err:.0f}".format(
-                receive_fps=receive_fps,
+            "转发帧率 {forward_fps:.1f} fps  |  当前队列 {queue_depth:.0f}  |  接收端处理 {process_ms:.1f} ms  |  "
+            "UDP 丢弃 {udp_drops:.0f}  |  队列丢弃 {queue_drops:.0f}  |  队列裁剪 {queue_trims:.0f}  |  "
+            "超大帧丢弃 {oversize_frames:.0f}  |  最近超大帧 {oversize_bytes:.1f} KB".format(
+                forward_fps=forward_fps,
+                queue_depth=snapshot.get("queue_depth", 0.0),
                 process_ms=snapshot.get("last_receiver_process_ms", 0.0),
-                queue_drop=snapshot.get("queue_drops", 0),
-                queue_trim=snapshot.get("queue_trims", 0),
-                udp_drop=snapshot.get("udp_drops", 0),
-                decode_err=snapshot.get("decode_errors", 0),
+                udp_drops=snapshot.get("udp_drops", 0.0),
+                queue_drops=snapshot.get("queue_drops", 0.0),
+                queue_trims=snapshot.get("queue_trims", 0.0),
+                oversize_frames=snapshot.get("udp_oversize_frames", 0.0),
+                oversize_bytes=oversize_bytes,
             )
         )
+
+        if self.preview_enabled_var.get():
+            preview_bytes = self.controller.pop_preview_frame()
+            if preview_bytes:
+                try:
+                    with Image.open(io.BytesIO(preview_bytes)) as image:
+                        self._last_preview_image = image.convert("RGB").copy()
+                    width, height = self._last_preview_image.size
+                    self.preview_meta_var.set(f"预览分辨率：{width} x {height}")
+                    self._refresh_preview_image()
+                except Exception:
+                    self.preview_hint_var.set("收到数据，但预览解码失败")
+                    self.preview_meta_var.set("预览分辨率：解码失败")
+
         self._tick_after_id = self.after(100, self._tick)
 
     def _drain_iface_results(self) -> None:
@@ -635,13 +883,18 @@ class ReceiverApp(tk.Tk):
             self._apply_interface_results(selected_label, saved_raw, interfaces, recommended, initial)
 
     def _cancel_tick(self) -> None:
-        if self._tick_after_id is None:
-            return
-        try:
-            self.after_cancel(self._tick_after_id)
-        except tk.TclError:
-            pass
-        self._tick_after_id = None
+        if self._tick_after_id is not None:
+            try:
+                self.after_cancel(self._tick_after_id)
+            except tk.TclError:
+                pass
+            self._tick_after_id = None
+        if self._preview_refresh_after_id is not None:
+            try:
+                self.after_cancel(self._preview_refresh_after_id)
+            except tk.TclError:
+                pass
+            self._preview_refresh_after_id = None
 
     def _set_status(self, kind: str, text: str, subtitle: str) -> None:
         self.status_var.set(text)
@@ -656,10 +909,7 @@ class ReceiverApp(tk.Tk):
             self.stop_button.state(["disabled"])
         else:
             self.status_badge.configure(style="BadgeIdle.TLabel")
-            if self._iface_loading or not self.iface_map:
-                self.start_button.state(["disabled"])
-            else:
-                self.start_button.state(["!disabled"])
+            self.start_button.state(["disabled"] if self._iface_loading or not self.iface_map else ["!disabled"])
             self.stop_button.state(["disabled"])
 
     def _set_interface_loading(self, hint_text: str) -> None:
@@ -673,98 +923,24 @@ class ReceiverApp(tk.Tk):
         if not self.controller.running:
             self.start_button.state(["disabled"])
 
-    def _on_preview_toggle(self) -> None:
-        enabled = self.preview_enabled_var.get()
-        self.controller.set_preview_enabled(enabled)
-        if enabled:
-            self.preview_meta_var.set("原始分辨率: 等待新画面")
-            self._clear_preview("实时预览已开启，等待新画面...")
-        else:
-            self.preview_meta_var.set("原始分辨率: 已关闭")
-            self._clear_preview("实时预览已关闭")
-
-    def _drain_preview_frames(self) -> None:
-        if not self.preview_enabled_var.get():
-            return
-        jpeg_bytes = self.controller.pop_preview_frame()
-        if not jpeg_bytes:
-            return
-        try:
-            image = Image.open(io.BytesIO(jpeg_bytes))
-            image.load()
-            image = image.convert("RGB")
-        except Exception:
-            self._clear_preview("预览解码失败，请检查发送画面数据")
-            return
-
-        self._last_preview_image = image
-        self._render_preview_image()
-        self.preview_meta_var.set(f"原始分辨率: {image.width}x{image.height}")
-        self.preview_hint_var.set(f"按比例预览 {image.width}x{image.height}")
-
-    def _clear_preview(self, hint: str) -> None:
-        self._preview_photo = None
-        self._last_preview_image = None
-        if hasattr(self, "preview_canvas"):
-            self.preview_canvas.delete("all")
-        if hasattr(self, "preview_label"):
-            self.preview_label.configure(image="", text=hint)
-            self.preview_label.lift()
-        self.preview_hint_var.set(hint)
-        if not self.preview_enabled_var.get():
-            self.preview_meta_var.set("原始分辨率: 已关闭")
-
-    def _on_preview_canvas_configure(self, _: object = None) -> None:
-        if not self.preview_enabled_var.get() or self._last_preview_image is None:
-            return
-        self._render_preview_image()
-
-    def _render_preview_image(self) -> None:
-        if self._last_preview_image is None:
-            return
-        target_width = self.preview_canvas.winfo_width()
-        target_height = self.preview_canvas.winfo_height()
-        if target_width <= 1 or target_height <= 1:
-            self.after(30, self._render_preview_image)
-            return
-        fitted = ImageOps.contain(
-            self._last_preview_image,
-            (target_width, target_height),
-            method=Image.Resampling.BILINEAR,
-        )
-        self._preview_photo = ImageTk.PhotoImage(fitted)
-        self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(target_width // 2, target_height // 2, image=self._preview_photo, anchor="center")
-        self.preview_label.configure(image="", text="")
-        self.preview_label.lower(self.preview_canvas)
-
     def _load_config(self) -> None:
         self._loaded_config = load_gui_config(RECEIVER_CONFIG)
-        loaded_udp_target = self._loaded_config.get("udp_target", self.udp_target_var.get())
-        if loaded_udp_target.strip() == "192.168.2.1:4455":
-            loaded_udp_target = "127.0.0.1:4455"
-        self.udp_target_var.set(loaded_udp_target)
+        self.udp_target_var.set(self._loaded_config.get("udp_target", self.udp_target_var.get()))
         self.queue_size_var.set(self._loaded_config.get("queue_size", self.queue_size_var.get()))
         self.max_age_var.set(self._loaded_config.get("max_age", self.max_age_var.get()))
-        preview_enabled_text = self._loaded_config.get("preview_enabled", "0").strip().lower()
-        self.preview_enabled_var.set(preview_enabled_text not in {"0", "false", "off", "no"})
-        self.controller.set_preview_enabled(self.preview_enabled_var.get())
-        if not self.preview_enabled_var.get():
-            self.preview_meta_var.set("原始分辨率: 已关闭")
-            self._clear_preview("实时预览已关闭")
+        preview_flag = (self._loaded_config.get("preview_enabled", "0").strip() == "1")
+        self.preview_enabled_var.set(preview_flag)
 
     def _save_config(self) -> None:
-        save_gui_config(
-            RECEIVER_CONFIG,
-            {
-                "iface_label": self.iface_var.get().strip(),
-                "iface_raw": self.iface_map.get(self.iface_var.get().strip(), ""),
-                "udp_target": self.udp_target_var.get().strip(),
-                "queue_size": self.queue_size_var.get().strip(),
-                "max_age": self.max_age_var.get().strip(),
-                "preview_enabled": "1" if self.preview_enabled_var.get() else "0",
-            },
-        )
+        payload = {
+            "iface_label": self.iface_var.get().strip(),
+            "iface_raw": self.iface_map.get(self.iface_var.get().strip(), ""),
+            "udp_target": self.udp_target_var.get().strip(),
+            "queue_size": self.queue_size_var.get().strip(),
+            "max_age": self.max_age_var.get().strip(),
+            "preview_enabled": "1" if self.preview_enabled_var.get() else "0",
+        }
+        save_gui_config(RECEIVER_CONFIG, payload)
 
     def _log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -784,6 +960,20 @@ class ReceiverApp(tk.Tk):
 
     def destroy(self) -> None:
         self._cancel_tick()
+        for after_id_attr in ("_initial_refresh_after_id", "_initial_layout_after_id"):
+            after_id = getattr(self, after_id_attr, None)
+            if after_id is not None:
+                try:
+                    self.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+                setattr(self, after_id_attr, None)
+        if self._layout_after_id is not None:
+            try:
+                self.after_cancel(self._layout_after_id)
+            except tk.TclError:
+                pass
+            self._layout_after_id = None
         super().destroy()
 
 

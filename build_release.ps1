@@ -5,6 +5,24 @@ function New-Utf8Text {
   return [System.Text.Encoding]::UTF8.GetString($Bytes)
 }
 
+function Resolve-ArchiveOutputPath {
+  param([string]$PreferredPath)
+  if (-not (Test-Path -LiteralPath $PreferredPath)) {
+    return $PreferredPath
+  }
+  try {
+    Remove-Item -LiteralPath $PreferredPath -Force -ErrorAction Stop
+    return $PreferredPath
+  } catch {
+    $directory = Split-Path -Parent $PreferredPath
+    $leaf = Split-Path -Leaf $PreferredPath
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
+    $ext = [System.IO.Path]::GetExtension($leaf)
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    return (Join-Path $directory ("{0}-{1}{2}" -f $base, $stamp, $ext))
+  }
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $root "release"
 $build = Join-Path $root "build"
@@ -20,16 +38,21 @@ $folderDist = Join-Path $dist $folderLabel
 $singleDist = Join-Path $dist $singleLabel
 $zipPath = Join-Path $root ("Ether-Stream-{0}.zip" -f $folderLabel)
 $singleZipPath = Join-Path $root ("Ether-Stream-{0}.zip" -f $singleLabel)
+$zipPath = Resolve-ArchiveOutputPath $zipPath
+$singleZipPath = Resolve-ArchiveOutputPath $singleZipPath
 
 if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -Force }
 if (Test-Path -LiteralPath $build) { Remove-Item -LiteralPath $build -Recurse -Force }
-if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-if (Test-Path -LiteralPath $singleZipPath) { Remove-Item -LiteralPath $singleZipPath -Force }
 
 python -m PyInstaller `
   --noconfirm `
   --clean `
   --windowed `
+  --hidden-import dxcam `
+  --hidden-import comtypes `
+  --hidden-import comtypes.client `
+  --hidden-import comtypes.stream `
+  --hidden-import turbojpeg `
   --exclude-module matplotlib `
   --exclude-module IPython `
   --exclude-module jupyter_client `
@@ -59,6 +82,11 @@ python -m PyInstaller `
   --clean `
   --windowed `
   --onefile `
+  --hidden-import dxcam `
+  --hidden-import comtypes `
+  --hidden-import comtypes.client `
+  --hidden-import comtypes.stream `
+  --hidden-import turbojpeg `
   --exclude-module matplotlib `
   --exclude-module IPython `
   --exclude-module jupyter_client `

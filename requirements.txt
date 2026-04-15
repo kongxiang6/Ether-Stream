@@ -3,5 +3,8 @@ Pillow
 numpy
 psutil
 mss
+dxcam
 opencv-python
+PyTurboJPEG
+turbojpeg
 pyinstaller

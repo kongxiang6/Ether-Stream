@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import queue
 import signal
 import socket
@@ -11,8 +12,8 @@ from typing import Callable, Optional
 from ether_stream.common import (
     ETHER_TYPE,
     FrameAssembler,
+    FragmentHeader,
     Stats,
-    drop_oldest_put,
     list_interfaces,
     print_interfaces,
     parse_udp_target,
@@ -22,6 +23,67 @@ from ether_stream.common import (
 
 _ASYNC_SNIFFER = None
 _ASYNC_SNIFFER_LOADED = False
+MAX_UDP_PAYLOAD_BYTES = 65507
+
+
+@dataclasses.dataclass(frozen=True)
+class QueuedFragment:
+    header: FragmentHeader
+    payload: bytes
+
+
+def _drop_oldest_frame_groups(
+    packet_queue: "queue.Queue[QueuedFragment]",
+    *,
+    target_depth: int,
+) -> tuple[int, list[int]]:
+    dropped_fragments = 0
+    dropped_frame_ids: list[int] = []
+    queue_mutex = getattr(packet_queue, "mutex", None)
+    queued_items = getattr(packet_queue, "queue", None)
+    if queue_mutex is None or queued_items is None:
+        return 0, []
+
+    with queue_mutex:
+        while queued_items and len(queued_items) > target_depth:
+            oldest_frame_id = queued_items[0].header.frame_id
+            dropped_frame_ids.append(oldest_frame_id)
+            while queued_items and queued_items[0].header.frame_id == oldest_frame_id:
+                queued_items.popleft()
+                dropped_fragments += 1
+
+        if dropped_fragments:
+            unfinished = getattr(packet_queue, "unfinished_tasks", 0)
+            packet_queue.unfinished_tasks = max(0, unfinished - dropped_fragments)
+            packet_queue.not_full.notify_all()
+
+    return dropped_fragments, dropped_frame_ids
+
+
+def _enqueue_latest_fragment(
+    packet_queue: "queue.Queue[QueuedFragment]",
+    fragment: QueuedFragment,
+    stats: Stats,
+) -> None:
+    try:
+        packet_queue.put_nowait(fragment)
+        return
+    except queue.Full:
+        pass
+
+    max_size = getattr(packet_queue, "maxsize", 0) or 1
+    dropped_fragments, dropped_frame_ids = _drop_oldest_frame_groups(
+        packet_queue,
+        target_depth=max(0, max_size - 1),
+    )
+    if dropped_fragments:
+        stats.add("queue_drops", dropped_fragments)
+        stats.add("queue_drop_frames", len(dropped_frame_ids))
+
+    try:
+        packet_queue.put_nowait(fragment)
+    except queue.Full:
+        stats.add("queue_drops", 1)
 
 
 class ReceiverThread(threading.Thread):
@@ -29,7 +91,7 @@ class ReceiverThread(threading.Thread):
         self,
         *,
         interface_name: str,
-        packet_queue: "queue.Queue[bytes]",
+        packet_queue: "queue.Queue[QueuedFragment]",
         stop_event: threading.Event,
         stats: Stats,
     ) -> None:
@@ -76,14 +138,23 @@ class ReceiverThread(threading.Thread):
 
         self._stats.add("captured_packets", 1)
         self._stats.add("captured_bytes", len(payload))
-        drop_oldest_put(self._packet_queue, payload, self._stats)
+        try:
+            header, fragment_payload = unpack_fragment(payload)
+        except Exception:
+            self._stats.add("decode_errors", 1)
+            return
+        _enqueue_latest_fragment(
+            self._packet_queue,
+            QueuedFragment(header=header, payload=fragment_payload),
+            self._stats,
+        )
 
 
 class ProcessorThread(threading.Thread):
     def __init__(
         self,
         *,
-        packet_queue: "queue.Queue[bytes]",
+        packet_queue: "queue.Queue[QueuedFragment]",
         udp_target: tuple[str, int],
         stop_event: threading.Event,
         assembler: FrameAssembler,
@@ -113,20 +184,20 @@ class ProcessorThread(threading.Thread):
             while not self._stop_event.is_set():
                 self._trim_backlog_if_needed()
                 try:
-                    payload = self._packet_queue.get(timeout=0.05)
+                    fragment = self._packet_queue.get(timeout=0.05)
                 except queue.Empty:
-                    continue
-
-                try:
-                    header, fragment_payload = unpack_fragment(payload)
-                except Exception:
-                    self._stats.add("decode_errors", 1)
                     continue
 
                 self._stats.add("processed_fragments", 1)
                 frame_process_started = time.perf_counter()
-                assembled = self._assembler.push(header, fragment_payload)
+                assembled = self._assembler.push(fragment.header, fragment.payload)
                 if assembled is None:
+                    continue
+
+                if len(assembled) > MAX_UDP_PAYLOAD_BYTES:
+                    self._stats.add("udp_oversize_frames", 1)
+                    self._stats.add("udp_drops", 1)
+                    self._stats.set("last_udp_oversize_bytes", float(len(assembled)))
                     continue
 
                 try:
@@ -162,18 +233,15 @@ class ProcessorThread(threading.Thread):
         if depth <= threshold:
             return
 
-        dropped = 0
-        while depth > target_depth:
-            try:
-                self._packet_queue.get_nowait()
-            except queue.Empty:
-                break
-            dropped += 1
-            depth -= 1
-
-        if dropped:
-            self._assembler.clear()
-            self._stats.add("queue_trims", dropped)
+        dropped_fragments, dropped_frame_ids = _drop_oldest_frame_groups(
+            self._packet_queue,
+            target_depth=target_depth,
+        )
+        if dropped_fragments:
+            for frame_id in dropped_frame_ids:
+                self._assembler.drop_frame(frame_id)
+            self._stats.add("queue_trims", dropped_fragments)
+            self._stats.add("queue_trim_frames", len(dropped_frame_ids))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -201,7 +269,7 @@ def main() -> int:
     udp_target = parse_udp_target(args.udp_target)
     stop_event = threading.Event()
     stats = Stats()
-    packet_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=max(1, args.queue_size))
+    packet_queue: "queue.Queue[QueuedFragment]" = queue.Queue(maxsize=max(1, args.queue_size))
     assembler = FrameAssembler(max_age=max(0.05, args.max_age))
 
     receiver_thread = ReceiverThread(
