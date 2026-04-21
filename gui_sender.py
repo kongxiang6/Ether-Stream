@@ -348,6 +348,19 @@ class SenderController:
             self.running = False
             raise
 
+    def update_capture_region(
+        self,
+        *,
+        bbox: Optional[tuple[int, int, int, int]],
+        target_size: Optional[tuple[int, int]],
+    ) -> None:
+        capture_worker = self.capture_worker
+        if not self.running or capture_worker is None:
+            return
+        updater = getattr(capture_worker, "update_capture_region", None)
+        if callable(updater):
+            updater(bbox=bbox, target_size=target_size)
+
     def stop(self) -> None:
         if not self.running:
             return
@@ -398,7 +411,7 @@ class SenderApp(tk.Tk):
         self._last_captured_frames = 0.0
         self._last_skipped_frames = 0.0
         self._last_reused_frames = 0.0
-        self._screen_bounds = _get_primary_screen_bounds()
+        self._screen_bounds = self._read_screen_geometry()
         self._manual_capture_bbox: Optional[tuple[int, int, int, int]] = None
         self._stat_cards: list[ttk.Frame] = []
         self._scroll_canvas: Optional[tk.Canvas] = None
@@ -919,16 +932,40 @@ class SenderApp(tk.Tk):
             raise ValueError(f"采集区域最大只能设置为 {MAX_CAPTURE_SIZE}")
         return size
 
-    def _screen_geometry(self) -> tuple[int, int, int, int]:
-        if self._screen_bounds is not None:
-            return self._screen_bounds
+    def _read_screen_geometry(self) -> tuple[int, int, int, int]:
+        bounds = _get_primary_screen_bounds()
+        if bounds is not None:
+            return bounds
         return (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
+
+    def _screen_geometry(self) -> tuple[int, int, int, int]:
+        self._screen_bounds = self._read_screen_geometry()
+        return self._screen_bounds
 
     def _center_bbox(self, size: int) -> tuple[int, int, int, int]:
         screen_left, screen_top, screen_width, screen_height = self._screen_geometry()
         left = screen_left + (screen_width - size) // 2
         top = screen_top + (screen_height - size) // 2
         return (left, top, left + size, top + size)
+
+    def _remap_manual_bbox_to_bounds(
+        self,
+        bbox: tuple[int, int, int, int],
+        old_bounds: tuple[int, int, int, int],
+        new_bounds: tuple[int, int, int, int],
+        size: int,
+    ) -> tuple[int, int, int, int]:
+        old_left, old_top, old_width, old_height = old_bounds
+        new_left, new_top, new_width, new_height = new_bounds
+        old_range_x = max(1, old_width - size)
+        old_range_y = max(1, old_height - size)
+        new_range_x = max(0, new_width - size)
+        new_range_y = max(0, new_height - size)
+        rel_left = (bbox[0] - old_left) / old_range_x
+        rel_top = (bbox[1] - old_top) / old_range_y
+        mapped_left = new_left + int(round(max(0.0, min(1.0, rel_left)) * new_range_x))
+        mapped_top = new_top + int(round(max(0.0, min(1.0, rel_top)) * new_range_y))
+        return (mapped_left, mapped_top, mapped_left + size, mapped_top + size)
 
     def _normalize_manual_bbox(self, bbox: tuple[int, int, int, int], size: int) -> tuple[int, int, int, int]:
         screen_left, screen_top, screen_width, screen_height = self._screen_geometry()
@@ -968,6 +1005,7 @@ class SenderApp(tk.Tk):
 
     def _on_capture_mode_changed(self, _: object = None) -> None:
         self._update_capture_mode_ui()
+        self._apply_live_capture_region()
 
     def _on_capture_size_commit(self, _: object = None) -> str:
         try:
@@ -979,6 +1017,7 @@ class SenderApp(tk.Tk):
         if self._manual_capture_bbox is not None:
             self._manual_capture_bbox = self._normalize_manual_bbox(self._manual_capture_bbox, size)
         self._update_capture_mode_ui()
+        self._apply_live_capture_region()
         return "break"
 
     def _choose_manual_capture_region(self) -> None:
@@ -996,6 +1035,7 @@ class SenderApp(tk.Tk):
         self._manual_capture_bbox = selected
         self.capture_mode_var.set(CAPTURE_MODE_LABELS["manual"])
         self._update_capture_mode_ui()
+        self._apply_live_capture_region()
 
     def _parse_capture_region(self) -> tuple[tuple[int, int, int, int], tuple[int, int]]:
         size = self._parse_capture_size()
@@ -1007,6 +1047,40 @@ class SenderApp(tk.Tk):
         else:
             bbox = self._center_bbox(size)
         return bbox, (size, size)
+
+    def _apply_live_capture_region(self) -> None:
+        if not self.controller.running:
+            return
+        try:
+            bbox, target_size = self._parse_capture_region()
+        except Exception as exc:
+            self._log(f"运行中未应用新的截取位置: {exc}")
+            return
+        self.controller.update_capture_region(bbox=bbox, target_size=target_size)
+        self._log(f"已切换截取位置: {bbox[0]},{bbox[1]} -> {bbox[2]},{bbox[3]}")
+
+    def _refresh_screen_geometry_if_needed(self) -> None:
+        previous_bounds = self._screen_bounds
+        current_bounds = self._read_screen_geometry()
+        self._screen_bounds = current_bounds
+        if previous_bounds is None or current_bounds == previous_bounds:
+            return
+        try:
+            size = self._parse_capture_size()
+        except Exception:
+            size = DEFAULT_CAPTURE_SIZE
+        if self._manual_capture_bbox is not None:
+            self._manual_capture_bbox = self._remap_manual_bbox_to_bounds(
+                self._manual_capture_bbox,
+                previous_bounds,
+                current_bounds,
+                size,
+            )
+        self._update_capture_mode_ui()
+        self._apply_live_capture_region()
+        old_width, old_height = previous_bounds[2], previous_bounds[3]
+        new_width, new_height = current_bounds[2], current_bounds[3]
+        self._log(f"检测到屏幕分辨率变化: {old_width}x{old_height} -> {new_width}x{new_height}，已自动校正截取位置")
 
     def _normalize_dst_mac_value(self) -> None:
         text = self.dst_mac_var.get().strip()
@@ -1089,6 +1163,7 @@ class SenderApp(tk.Tk):
 
     def _tick(self) -> None:
         self._drain_iface_results()
+        self._refresh_screen_geometry_if_needed()
         snapshot = self.controller.snapshot()
         now = time.perf_counter()
         elapsed = max(0.001, now - self._last_rate_sample_time)

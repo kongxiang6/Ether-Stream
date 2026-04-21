@@ -47,6 +47,11 @@ _SCAPY_CONF = None
 _SCAPY_LOADED = False
 SAFE_UDP_JPEG_BYTES = 60000
 MIN_ADAPTIVE_JPEG_QUALITY = 10
+_TIMER_RESOLUTION_LOCK = threading.Lock()
+_TIMER_RESOLUTION_USERS = 0
+_TIMER_RESOLUTION_MS = 1
+THREAD_PRIORITY_ABOVE_NORMAL = 1
+THREAD_PRIORITY_HIGHEST = 2
 
 
 @dataclasses.dataclass
@@ -123,6 +128,66 @@ class JpegEncoder:
         return buffer.getvalue()
 
 
+def _sleep_until_precise(next_tick: float, interval: float) -> float:
+    next_tick += interval
+    while True:
+        wait_time = next_tick - time.perf_counter()
+        if wait_time <= 0:
+            if interval <= 0:
+                return time.perf_counter()
+            missed = int((-wait_time) / interval) + 1
+            return next_tick + (missed * interval)
+        if wait_time > 0.003:
+            time.sleep(wait_time - 0.0015)
+            continue
+        if wait_time > 0.001:
+            time.sleep(0)
+            continue
+        while time.perf_counter() < next_tick:
+            pass
+        return next_tick
+
+
+def _acquire_high_precision_timer() -> None:
+    global _TIMER_RESOLUTION_USERS
+    if not hasattr(ctypes, "windll"):
+        return
+    with _TIMER_RESOLUTION_LOCK:
+        _TIMER_RESOLUTION_USERS += 1
+        if _TIMER_RESOLUTION_USERS != 1:
+            return
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(_TIMER_RESOLUTION_MS)
+        except Exception:
+            _TIMER_RESOLUTION_USERS -= 1
+
+
+def _release_high_precision_timer() -> None:
+    global _TIMER_RESOLUTION_USERS
+    if not hasattr(ctypes, "windll"):
+        return
+    with _TIMER_RESOLUTION_LOCK:
+        if _TIMER_RESOLUTION_USERS <= 0:
+            return
+        _TIMER_RESOLUTION_USERS -= 1
+        if _TIMER_RESOLUTION_USERS != 0:
+            return
+        try:
+            ctypes.windll.winmm.timeEndPeriod(_TIMER_RESOLUTION_MS)
+        except Exception:
+            pass
+
+
+def _set_current_thread_priority(priority: int) -> None:
+    if not hasattr(ctypes, "windll"):
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), priority)
+    except Exception:
+        pass
+
+
 class CaptureWorker(threading.Thread):
     def __init__(
         self,
@@ -137,19 +202,41 @@ class CaptureWorker(threading.Thread):
         super().__init__(daemon=True)
         self._stop_event = stop_event
         self._frame_store = frame_store
+        self._config_lock = threading.Lock()
+        self._config_version = 0
         self._bbox = bbox
         self._target_size = target_size
         self._fps = fps
         self._stats = stats
 
+    def update_capture_region(
+        self,
+        *,
+        bbox: Optional[Tuple[int, int, int, int]],
+        target_size: Optional[Tuple[int, int]],
+    ) -> None:
+        with self._config_lock:
+            self._bbox = bbox
+            self._target_size = target_size
+            self._config_version += 1
+
+    def _capture_config_snapshot(self) -> tuple[Optional[Tuple[int, int, int, int]], Optional[Tuple[int, int]], int]:
+        with self._config_lock:
+            return self._bbox, self._target_size, self._config_version
+
     def run(self) -> None:
+        _set_current_thread_priority(THREAD_PRIORITY_HIGHEST)
+        _acquire_high_precision_timer()
         interval = 1.0 / max(1, self._fps)
         self._stats.set("capture_target_fps", float(self._fps))
-        if self._run_dxcam(interval):
-            return
-        if self._run_mss(interval):
-            return
-        self._run_pillow(interval)
+        try:
+            if self._run_dxcam(interval):
+                return
+            if self._run_mss(interval):
+                return
+            self._run_pillow(interval)
+        finally:
+            _release_high_precision_timer()
 
     def _run_dxcam(self, interval: float) -> bool:
         camera = _open_dxcam_camera()
@@ -161,21 +248,27 @@ class CaptureWorker(threading.Thread):
         self._stats.set("capture_backend_pillow", 0.0)
         next_tick = time.perf_counter()
         started = False
+        active_bbox, _, active_version = self._capture_config_snapshot()
         try:
-            try:
-                camera.start(region=self._bbox, target_fps=max(1, self._fps), video_mode=True)
-            except TypeError:
-                camera.start(region=self._bbox, target_fps=max(1, self._fps))
+            self._start_dxcam(camera, active_bbox)
             started = True
             while not self._stop_event.is_set():
                 try:
+                    current_bbox, target_size, current_version = self._capture_config_snapshot()
+                    if current_version != active_version:
+                        self._restart_dxcam(camera, current_bbox)
+                        active_bbox = current_bbox
+                        active_version = current_version
+                        time.sleep(min(0.002, interval))
+                        next_tick = self._sleep_until(next_tick, interval)
+                        continue
                     capture_start = time.perf_counter()
                     frame = camera.get_latest_frame()
                     if frame is None:
                         time.sleep(min(0.002, interval))
                         next_tick = self._sleep_until(next_tick, interval)
                         continue
-                    frame = _maybe_resize_bgr(frame, self._target_size)
+                    frame = _maybe_resize_bgr(frame, target_size)
                     capture_ms = (time.perf_counter() - capture_start) * 1000.0
                     self._frame_store.write(CapturedFrame(frame=frame, captured_at=time.perf_counter(), capture_ms=capture_ms))
                     self._stats.add("captured_frames", 1)
@@ -199,6 +292,19 @@ class CaptureWorker(threading.Thread):
             except Exception:
                 pass
 
+    def _start_dxcam(self, camera: object, bbox: Optional[Tuple[int, int, int, int]]) -> None:
+        try:
+            camera.start(region=bbox, target_fps=max(1, self._fps), video_mode=True)
+        except TypeError:
+            camera.start(region=bbox, target_fps=max(1, self._fps))
+
+    def _restart_dxcam(self, camera: object, bbox: Optional[Tuple[int, int, int, int]]) -> None:
+        try:
+            camera.stop()
+        except Exception:
+            pass
+        self._start_dxcam(camera, bbox)
+
     def _run_mss(self, interval: float) -> bool:
         mss_module = _load_mss_module()
         if mss_module is None:
@@ -211,8 +317,9 @@ class CaptureWorker(threading.Thread):
             with mss_module.mss() as capture:
                 while not self._stop_event.is_set():
                     try:
+                        bbox, target_size, _ = self._capture_config_snapshot()
                         capture_start = time.perf_counter()
-                        frame = self._grab_with_mss(capture)
+                        frame = self._grab_with_mss(capture, bbox=bbox, target_size=target_size)
                         capture_ms = (time.perf_counter() - capture_start) * 1000.0
                         self._frame_store.write(CapturedFrame(frame=frame, captured_at=time.perf_counter(), capture_ms=capture_ms))
                         self._stats.add("captured_frames", 1)
@@ -232,8 +339,9 @@ class CaptureWorker(threading.Thread):
         next_tick = time.perf_counter()
         while not self._stop_event.is_set():
             try:
+                bbox, target_size, _ = self._capture_config_snapshot()
                 capture_start = time.perf_counter()
-                frame = self._grab_with_pillow()
+                frame = self._grab_with_pillow(bbox=bbox, target_size=target_size)
                 capture_ms = (time.perf_counter() - capture_start) * 1000.0
                 self._frame_store.write(CapturedFrame(frame=frame, captured_at=time.perf_counter(), capture_ms=capture_ms))
                 self._stats.add("captured_frames", 1)
@@ -243,32 +351,37 @@ class CaptureWorker(threading.Thread):
                 time.sleep(0.050)
             next_tick = self._sleep_until(next_tick, interval)
 
-    def _grab_with_mss(self, capture: "mss.mss") -> object:
-        if self._bbox:
-            left, top, right, bottom = self._bbox
+    def _grab_with_mss(
+        self,
+        capture: "mss.mss",
+        *,
+        bbox: Optional[Tuple[int, int, int, int]],
+        target_size: Optional[Tuple[int, int]],
+    ) -> object:
+        if bbox:
+            left, top, right, bottom = bbox
             monitor = {"left": left, "top": top, "width": right - left, "height": bottom - top}
         else:
             monitor = capture.monitors[1]
         grabbed = capture.grab(monitor)
-        bgr_frame = _maybe_capture_bgr(grabbed, self._target_size)
+        bgr_frame = _maybe_capture_bgr(grabbed, target_size)
         if bgr_frame is not None:
             return bgr_frame
         frame = Image.frombytes("RGB", grabbed.size, grabbed.rgb)
-        return _maybe_resize(frame, self._target_size)
+        return _maybe_resize(frame, target_size)
 
-    def _grab_with_pillow(self) -> Image.Image:
-        frame = ImageGrab.grab(bbox=self._bbox, all_screens=self._bbox is None)
-        return _maybe_resize(frame, self._target_size)
+    def _grab_with_pillow(
+        self,
+        *,
+        bbox: Optional[Tuple[int, int, int, int]],
+        target_size: Optional[Tuple[int, int]],
+    ) -> Image.Image:
+        frame = ImageGrab.grab(bbox=bbox, all_screens=bbox is None)
+        return _maybe_resize(frame, target_size)
 
     @staticmethod
     def _sleep_until(next_tick: float, interval: float) -> float:
-        next_tick += interval
-        wait_time = next_tick - time.perf_counter()
-        if wait_time > 0:
-            time.sleep(wait_time)
-        else:
-            next_tick = time.perf_counter()
-        return next_tick
+        return _sleep_until_precise(next_tick, interval)
 
 
 class EncodeWorker(threading.Thread):
@@ -302,6 +415,7 @@ class EncodeWorker(threading.Thread):
         self._last_encoded_frame: EncodedFrame | None = None
 
     def run(self) -> None:
+        _set_current_thread_priority(THREAD_PRIORITY_ABOVE_NORMAL)
         last_sequence = 0
         self._stats.set("jpeg_quality", self._quality)
         self._stats.set("jpeg_target_quality", float(self._quality_ceiling))
@@ -450,6 +564,8 @@ class SendWorker(threading.Thread):
         self._ether_prefix = _build_ether_prefix(source_mac, target_mac)
 
     def run(self) -> None:
+        _set_current_thread_priority(THREAD_PRIORITY_HIGHEST)
+        _acquire_high_precision_timer()
         interval = 1.0 / max(1, self._send_fps)
         next_tick = time.perf_counter()
         frame_id = 0
@@ -461,69 +577,66 @@ class SendWorker(threading.Thread):
         except Exception:
             raw_sender = None
         self._stats.set("sender_backend_l2socket", 1.0 if raw_sender is not None else 0.0)
-        while not self._stop_event.is_set():
-            encoded_sequence, encoded = self._encoded_store.peek_latest()
-            if encoded is None:
-                time.sleep(min(0.003, interval))
+        try:
+            while not self._stop_event.is_set():
+                encoded_sequence, encoded = self._encoded_store.peek_latest()
+                if encoded is None:
+                    time.sleep(min(0.003, interval))
+                    next_tick = self._sleep_until(next_tick, interval)
+                    continue
+                try:
+                    assert isinstance(encoded, EncodedFrame)
+                    if encoded_sequence == last_encoded_sequence:
+                        self._stats.add("reused_frame_sends", 1)
+                    else:
+                        last_encoded_sequence = encoded_sequence
+                        self._stats.set("last_source_capture_ms", encoded.capture_ms)
+                        self._stats.set("last_source_encode_ms", encoded.encode_ms)
+                    frame_age_ms = max(0.0, (time.perf_counter() - encoded.captured_at) * 1000.0)
+                    send_started_ms = int(time.time() * 1000)
+                    send_start = time.perf_counter()
+                    sent_fragments = send_frame(
+                        interface_name=self._interface_name,
+                        source_mac=self._source_mac,
+                        target_mac=self._target_mac,
+                        frame_id=frame_id,
+                        jpeg_bytes=encoded.jpeg_bytes,
+                        frame_payload_budget=self._frame_payload_budget,
+                        sent_timestamp_ms=send_started_ms,
+                        sender_socket=raw_sender,
+                        ether_prefix=self._ether_prefix,
+                    )
+                    send_ms = (time.perf_counter() - send_start) * 1000.0
+                    self._stats.set("last_send_ms", send_ms)
+                    self._stats.set("last_frame_age_ms", frame_age_ms)
+                    self._stats.set("last_pipeline_ms", encoded.capture_ms + encoded.encode_ms + send_ms)
+                    self._stats.set("last_fragment_count", float(sent_fragments))
+                    self._stats.add("sent_frames", 1)
+                    self._stats.add("sent_fragments", sent_fragments)
+                    self._stats.add("sent_bytes", len(encoded.jpeg_bytes))
+                    frame_id = (frame_id + 1) & 0xFFFFFFFF
+                except Exception:
+                    self._stats.add("send_errors", 1)
+                    if raw_sender is not None:
+                        try:
+                            raw_sender.close()
+                        except Exception:
+                            pass
+                        raw_sender = None
+                        self._stats.set("sender_backend_l2socket", 0.0)
+                    time.sleep(0.010)
                 next_tick = self._sleep_until(next_tick, interval)
-                continue
-            try:
-                assert isinstance(encoded, EncodedFrame)
-                if encoded_sequence == last_encoded_sequence:
-                    self._stats.add("reused_frame_sends", 1)
-                else:
-                    last_encoded_sequence = encoded_sequence
-                    self._stats.set("last_source_capture_ms", encoded.capture_ms)
-                    self._stats.set("last_source_encode_ms", encoded.encode_ms)
-                frame_age_ms = max(0.0, (time.perf_counter() - encoded.captured_at) * 1000.0)
-                send_started_ms = int(time.time() * 1000)
-                send_start = time.perf_counter()
-                sent_fragments = send_frame(
-                    interface_name=self._interface_name,
-                    source_mac=self._source_mac,
-                    target_mac=self._target_mac,
-                    frame_id=frame_id,
-                    jpeg_bytes=encoded.jpeg_bytes,
-                    frame_payload_budget=self._frame_payload_budget,
-                    sent_timestamp_ms=send_started_ms,
-                    sender_socket=raw_sender,
-                    ether_prefix=self._ether_prefix,
-                )
-                send_ms = (time.perf_counter() - send_start) * 1000.0
-                self._stats.set("last_send_ms", send_ms)
-                self._stats.set("last_frame_age_ms", frame_age_ms)
-                self._stats.set("last_pipeline_ms", encoded.capture_ms + encoded.encode_ms + send_ms)
-                self._stats.set("last_fragment_count", float(sent_fragments))
-                self._stats.add("sent_frames", 1)
-                self._stats.add("sent_fragments", sent_fragments)
-                self._stats.add("sent_bytes", len(encoded.jpeg_bytes))
-                frame_id = (frame_id + 1) & 0xFFFFFFFF
-            except Exception:
-                self._stats.add("send_errors", 1)
-                if raw_sender is not None:
-                    try:
-                        raw_sender.close()
-                    except Exception:
-                        pass
-                    raw_sender = None
-                    self._stats.set("sender_backend_l2socket", 0.0)
-                time.sleep(0.010)
-            next_tick = self._sleep_until(next_tick, interval)
-        if raw_sender is not None:
-            try:
-                raw_sender.close()
-            except Exception:
-                pass
+        finally:
+            if raw_sender is not None:
+                try:
+                    raw_sender.close()
+                except Exception:
+                    pass
+            _release_high_precision_timer()
 
     @staticmethod
     def _sleep_until(next_tick: float, interval: float) -> float:
-        next_tick += interval
-        wait_time = next_tick - time.perf_counter()
-        if wait_time > 0:
-            time.sleep(wait_time)
-        else:
-            next_tick = time.perf_counter()
-        return next_tick
+        return _sleep_until_precise(next_tick, interval)
 
 
 def _estimate_fragment_count(jpeg_size: int, frame_payload_budget: int) -> int:

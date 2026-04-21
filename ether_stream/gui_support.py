@@ -108,22 +108,34 @@ class ToolTip:
         self.wraplength = wraplength
         self.tip_window: Optional[tk.Toplevel] = None
         self._after_id: Optional[str] = None
+        self._destroyed = False
         widget.bind("<Enter>", self._schedule_show, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._on_destroy, add="+")
 
     def _schedule_show(self, _: tk.Event[tk.Misc]) -> None:
+        if self._destroyed:
+            return
         self._cancel()
-        self._after_id = self.widget.after(450, self._show)
+        try:
+            self._after_id = self.widget.after(450, self._show)
+        except tk.TclError:
+            self._after_id = None
 
     def _show(self) -> None:
-        if self.tip_window is not None or not self.text:
+        self._after_id = None
+        if self._destroyed or self.tip_window is not None or not self.text:
             return
-        x = self.widget.winfo_rootx() + 18
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-        self.tip_window = tk.Toplevel(self.widget)
-        self.tip_window.wm_overrideredirect(True)
-        self.tip_window.wm_geometry(f"+{x}+{y}")
+        try:
+            x = self.widget.winfo_rootx() + 18
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            self.tip_window = tk.Toplevel(self.widget)
+            self.tip_window.wm_overrideredirect(True)
+            self.tip_window.wm_geometry(f"+{x}+{y}")
+        except tk.TclError:
+            self.tip_window = None
+            return
         label = tk.Label(
             self.tip_window,
             text=self.text,
@@ -142,10 +154,20 @@ class ToolTip:
     def _hide(self, _: object = None) -> None:
         self._cancel()
         if self.tip_window is not None:
-            self.tip_window.destroy()
+            try:
+                self.tip_window.destroy()
+            except tk.TclError:
+                pass
             self.tip_window = None
+
+    def _on_destroy(self, _: object = None) -> None:
+        self._destroyed = True
+        self._hide()
 
     def _cancel(self) -> None:
         if self._after_id is not None:
-            self.widget.after_cancel(self._after_id)
+            try:
+                self.widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
             self._after_id = None
